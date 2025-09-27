@@ -45,22 +45,6 @@ const bresenham = (a: Point, b: Point): Point[] => {
   return points;
 };
 
-// Dilate a set of points by Chebyshev radius r (square neighborhood)
-const dilateChebyshev = (openSet: Set<string>, width: number, height: number, r: number): Set<string> => {
-  if (r <= 0) return new Set(openSet);
-  const out = new Set<string>();
-  for (const s of openSet) {
-    const { x, y } = unkey(s);
-    for (let dx = -r; dx <= r; dx++) {
-      for (let dy = -r; dy <= r; dy++) {
-        const nx = x + dx, ny = y + dy;
-        if (nx >= 0 && nx < width && ny >= 0 && ny < height) out.add(key({ x: nx, y: ny }));
-      }
-    }
-  }
-  return out;
-};
-
 // Turn/chokepoint detection helpers
 const isCollinear = (a: Point, b: Point, c: Point) => {
   const ab = dir(a, b);
@@ -70,10 +54,10 @@ const isCollinear = (a: Point, b: Point, c: Point) => {
 
 /**
  * 1) Build a dictionary (Map) of 'turns':
- *    Given a list of open coordinates (NOT just waypoints—actual open cells),
- *    we compute, for every node, the 4-neighborhood degree. We mark a node as:
- *    - a fork/chokepoint if degree != 2, OR
- *    - a true 90° bend if degree == 2 but neighbors are not collinear.
+ *    Given a list of open coordinates (actual open cells),
+ *    mark nodes that are:
+ *    - fork/chokepoint if degree != 2, OR
+ *    - true 90° bend if degree == 2 but neighbors are not collinear.
  *    The value lists the neighbor coordinates (possible outgoing directions).
  */
 export function buildTurnMap(openCoords: Point[]): Map<string, Point[]> {
@@ -89,7 +73,6 @@ export function buildTurnMap(openCoords: Point[]): Map<string, Point[]> {
     if (nbrs.length !== 2) {
       isTurn = true; // dead-end, T, or cross
     } else {
-      // Exactly two neighbors: check if they form a straight line through p
       const [n1, n2] = nbrs;
       isTurn = !isCollinear(n1, p, n2);
     }
@@ -113,20 +96,13 @@ export function buildTurnMapFromGrid(grid: Grid): Map<string, Point[]> {
 
 /**
  * 2) Rasterize a polyline (list of cartesian coordinates) into a 2D grid (width×height),
- *    then "thicken" paths by tolerance=2 on each side via Chebyshev dilation.
- *    Everything not in the dilated set becomes a wall (1).
- * 
- *    Notes:
- *    - We connect successive points in the given list with Bresenham segments.
- *    - If you have multiple separate polylines, call this function with the concatenated
- *      points and insert a sentinel to break? Simpler approach: call multiple times and OR
- *      the open sets, or pass all polylines joined and they’ll connect—your choice.
+ *    WITHOUT any tolerance/dilation. Only exact Bresenham cells are open.
+ *    Everything else is a wall (1).
  */
 export function rasterizePathsToGrid(
   polyline: Point[],
   width: number,
-  height: number,
-  tolerance: number = 2
+  height: number
 ): Grid {
   const rawOpen = new Set<string>();
   for (let i = 0; i < polyline.length - 1; i++) {
@@ -137,10 +113,10 @@ export function rasterizePathsToGrid(
       }
     }
   }
-  const dilated = dilateChebyshev(rawOpen, width, height, Math.max(0, tolerance));
-  // Build grid
+
+  // Build grid (1 = wall by default, 0 = open for path cells only)
   const grid: Grid = Array.from({ length: height }, () => Array.from({ length: width }, () => 1));
-  for (const s of dilated) {
+  for (const s of rawOpen) {
     const { x, y } = unkey(s);
     grid[y][x] = 0; // open
   }
@@ -148,16 +124,40 @@ export function rasterizePathsToGrid(
 }
 
 /**
+ * Helper: snap a point to the nearest open cell (BFS) or return null if none.
+ */
+export function findNearestOpen(start: Point, grid: Grid): Point | null {
+  const H = grid.length, W = grid[0].length;
+  const inb = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < H;
+
+  if (inb(start.x, start.y) && grid[start.y][start.x] === 0) return start;
+
+  const q: Point[] = [start];
+  const seen = new Set<string>([key(start)]);
+  const steps = [{x:1,y:0},{x:-1,y:0},{x:0,y:1},{x:0,y:-1}];
+
+  while (q.length) {
+    const p = q.shift()!;
+    for (const d of steps) {
+      const nx = p.x + d.x, ny = p.y + d.y;
+      if (!inb(nx, ny)) continue;
+      const k = `${nx},${ny}`;
+      if (seen.has(k)) continue;
+      seen.add(k);
+      if (grid[ny][nx] === 0) return { x: nx, y: ny };
+      q.push({ x: nx, y: ny });
+    }
+  }
+  return null;
+}
+
+/**
  * 3) A* search on a 2D grid (4-connected), returning:
  *    - path: shortest list of Points from start→goal (inclusive), or [] if none
  *    - turns: list of Points along that path where direction changes (or that are listed in turnMap)
  *
- *    Heuristic: Manhattan distance
+ *    Heuristic: Manhattan
  *    Cost: uniform (1 per move)
- *
- *    We also compute "turns" in two ways:
- *      (A) geometric turns (where direction vector changes),
- *      (B) chokepoints that appear in the provided turnMap.
  */
 export function aStarWithTurns(
   grid: Grid,
@@ -165,8 +165,14 @@ export function aStarWithTurns(
   goal: Point,
   turnMap: Map<string, Point[]>
 ): { path: Point[]; turns: Point[] } {
+  // Early out if start/goal are not open
+  const H = grid.length, W = grid[0].length;
+  const inb = (p: Point) => p.x >= 0 && p.y >= 0 && p.x < W && p.y < H;
+  if (!inb(start) || !inb(goal) || grid[start.y][start.x] !== 0 || grid[goal.y][goal.x] !== 0) {
+    return { path: [], turns: [] };
+  }
+
   const h = (p: Point) => Math.abs(p.x - goal.x) + Math.abs(p.y - goal.y);
-  const height = grid.length, width = grid[0].length;
 
   const openSet = new Set<string>([key(start)]);
   const cameFrom = new Map<string, string>();
@@ -176,7 +182,6 @@ export function aStarWithTurns(
   gScore.set(key(start), 0);
   fScore.set(key(start), h(start));
 
-  // Simple binary-heap substitute: pick min fScore by scan (OK for 50x50).
   const popMin = (): string | null => {
     let best: string | null = null;
     let bestF = Infinity;
@@ -189,7 +194,7 @@ export function aStarWithTurns(
   };
 
   const isOpen = (p: Point) =>
-    p.x >= 0 && p.x < width && p.y >= 0 && p.y < height && grid[p.y][p.x] === 0;
+    p.x >= 0 && p.x < W && p.y >= 0 && p.y < H && grid[p.y][p.x] === 0;
 
   while (openSet.size > 0) {
     const currentKey = popMin();
@@ -242,9 +247,11 @@ export function aStarWithTurns(
 
 // --------- Extras (handy for debugging) ----------
 
-export function gridToString(grid: Grid, path: Point[] = [], start?: Point, goal?: Point): string {
+export function gridToString(grid: Grid, path: Point[] = [], start?: Point, goal?: Point, turns: Point[] = [], allTurns: Point[] = []): string {
   const H = grid.length, W = grid[0].length;
   const pathSet = new Set(path.map(key));
+  const turnSet = new Set(turns.map(key));
+  const allTurnSet = new Set(allTurns.map(key));
   const sKey = start ? key(start) : null;
   const gKey = goal ? key(goal) : null;
 
@@ -254,6 +261,8 @@ export function gridToString(grid: Grid, path: Point[] = [], start?: Point, goal
       const k = `${x},${y}`;
       if (sKey === k) out += "S";
       else if (gKey === k) out += "G";
+      else if (turnSet.has(k)) out += "T";  // T for turns taken on path
+      else if (allTurnSet.has(k)) out += "t";  // t for other turns in grid
       else if (pathSet.has(k)) out += "*";
       else out += grid[y][x] === 0 ? "." : "#";
     }
