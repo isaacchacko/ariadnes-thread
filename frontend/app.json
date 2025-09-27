@@ -9,7 +9,13 @@
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "infoPlist": {
+        "NSCameraUsageDescription": "Camera is used to record mapping videos for indoor wayfinding.",
+        "NSMicrophoneUsageDescription": "Microphone is used to record audio while capturing mapping videos.",
+        "NSMotionUsageDescription": "Motion data is used to estimate heading and turns during mapping."
+      },
+      "bundleIdentifier": "com.anonymous.real-frontend"
     },
     "android": {
       "adaptiveIcon": {
@@ -19,7 +25,11 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "output": "static",
@@ -27,6 +37,19 @@
     },
     "plugins": [
       "expo-router",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Ariadne to use the camera to record indoor mapping videos.",
+          "microphonePermission": "Allow Ariadne to use the microphone while recording video."
+        }
+      ],
+      [
+        "expo-sensors",
+        {
+          "motionPermission": "Allow Ariadne to access device motion for heading and turns."
+        }
+      ],
       [
         "expo-splash-screen",
         {
