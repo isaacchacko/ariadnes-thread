@@ -272,7 +272,8 @@ socket.on('accel-data', data => {
 socket.on('gyro-data', data => {
   // Use gyroscope data for sensor fusion orientation estimation
   // The gyro data should be in degrees/second format: {x: pitch_rate, y: roll_rate, z: yaw_rate}
-  const gyro = [data.x, data.y, data.z]; // [pitch_rate, roll_rate, yaw_rate] in deg/s
+  console.log(data);
+const gyro = [data.rotationRate.alpha, data.rotationRate.beta, data.rotationRate.gamma];
 
   // Get the most recent accelerometer data for sensor fusion
   if (dataArrays.x.accel.length > 0) {
