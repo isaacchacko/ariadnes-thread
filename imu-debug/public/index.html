@@ -1,0 +1,292 @@
+<div>
+  <button id="toggle-x">x</button>
+  <button id="toggle-y">y</button>
+  <button id="toggle-z">z</button>
+</div>
+<div id="plotly-chart" style="width:90vw; height:60vh;"></div>
+
+<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+
+<script>
+const chartDiv = document.getElementById('plotly-chart');
+
+// Data arrays for each axis and type
+const dataArrays = {
+  x: { accel: [], velocity: [], position: [], timestamp: [], fusedAccel: [] },
+  y: { accel: [], velocity: [], position: [], timestamp: [], fusedAccel: [] },
+  z: { accel: [], velocity: [], position: [], timestamp: [], fusedAccel: [] }
+};
+
+// Sensor fusion state variables
+let quaternion = [1.0, 0.0, 0.0, 0.0]; // [w, x, y, z] - initial quaternion (no rotation)
+let gravity = [0, 0, 9.81]; // gravity vector in world frame (NED: down is positive)
+const ALPHA = 0.98; // Complementary filter constant (98% gyro, 2% accel for orientation)
+const GYRO_NOISE_THRESHOLD = 0.1; // Threshold for gyro noise (rad/s)
+const ACCEL_NOISE_THRESHOLD = 2.0; // Threshold for detecting excessive acceleration (g)
+
+// Plotly initial traces: Raw Accel, Fused Accel, Velocity, Position for x, y, z
+const traceConfig = [
+  { name: 'Raw Accel X', y: [], x: [], mode: 'lines', line: { color: 'red', dash: 'dash' }, visible: true },
+  { name: 'Raw Accel Y', y: [], x: [], mode: 'lines', line: { color: 'green', dash: 'dash' }, visible: true },
+  { name: 'Raw Accel Z', y: [], x: [], mode: 'lines', line: { color: 'blue', dash: 'dash' }, visible: true },
+  { name: 'Fused Accel X', y: [], x: [], mode: 'lines', line: { color: 'red' }, visible: true },
+  { name: 'Fused Accel Y', y: [], x: [], mode: 'lines', line: { color: 'green' }, visible: true },
+  { name: 'Fused Accel Z', y: [], x: [], mode: 'lines', line: { color: 'blue' }, visible: true },
+  { name: 'Vel X', y: [], x: [], mode: 'lines', line: { color: 'red', dash:'dot' }, visible: true },
+  { name: 'Vel Y', y: [], x: [], mode: 'lines', line: { color: 'green', dash:'dot' }, visible: true },
+  { name: 'Vel Z', y: [], x: [], mode: 'lines', line: { color: 'blue', dash:'dot' }, visible: true },
+  { name: 'Pos X', y: [], x: [], mode: 'lines', line: { color: 'red', dash:'dashdot' }, visible: true },
+  { name: 'Pos Y', y: [], x: [], mode: 'lines', line: { color: 'green', dash:'dashdot' }, visible: true },
+  { name: 'Pos Z', y: [], x: [], mode: 'lines', line: { color: 'blue', dash:'dashdot' }, visible: true }
+];
+
+Plotly.newPlot(chartDiv, traceConfig, {
+  title: 'Sensor Fusion: Raw vs Fused Accelerometer Data',
+  xaxis: { title: 'Timestamp' },
+  yaxis: { title: 'Value' }
+});
+
+// This array tracks visibility for each axis (toggle states)
+const visibleAxes = { x: true, y: true, z: true };
+
+// Button event listeners for toggling axis visibility
+['x','y','z'].forEach((axis, i) => {
+  document.getElementById(`toggle-${axis}`).addEventListener('click', () => {
+    visibleAxes[axis] = !visibleAxes[axis];
+    // Each axis has 4 traces in this order: raw accel, fused accel, velocity, position
+    for(let j=0;j<4;j++){
+      Plotly.restyle(chartDiv, {'visible': visibleAxes[axis]}, [i+j*3]);
+    }
+  });
+});
+
+// Quaternion utility functions
+function quaternionMultiply(q1, q2) {
+  const [w1, x1, y1, z1] = q1;
+  const [w2, x2, y2, z2] = q2;
+  return [
+    w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    w1*x2 + x1*w2 + y1*z2 - z1*y2,
+    w1*y2 - x1*z2 + y1*w2 + z1*x2,
+    w1*z2 + x1*y2 - y1*x2 + z1*w2
+  ];
+}
+
+function quaternionNormalize(q) {
+  const norm = Math.sqrt(q[0]*q[0] + q[1]*q[1] + q[2]*q[2] + q[3]*q[3]);
+  return norm > 0 ? [q[0]/norm, q[1]/norm, q[2]/norm, q[3]/norm] : [1, 0, 0, 0];
+}
+
+function quaternionConjugate(q) {
+  return [q[0], -q[1], -q[2], -q[3]];
+}
+
+function rotateVectorByQuaternion(vec, q) {
+  // Convert vector to quaternion [0, x, y, z]
+  const vecQuat = [0, vec[0], vec[1], vec[2]];
+  const qConj = quaternionConjugate(q);
+  const rotated = quaternionMultiply(quaternionMultiply(q, vecQuat), qConj);
+  return [rotated[1], rotated[2], rotated[3]];
+}
+
+function vector3Magnitude(vec) {
+  return Math.sqrt(vec[0]*vec[0] + vec[1]*vec[1] + vec[2]*vec[2]);
+}
+
+function vector3Normalize(vec) {
+  const mag = vector3Magnitude(vec);
+  return mag > 0 ? [vec[0]/mag, vec[1]/mag, vec[2]/mag] : [0, 0, 0];
+}
+
+function vector3Cross(a, b) {
+  return [
+    a[1]*b[2] - a[2]*b[1],
+    a[2]*b[0] - a[0]*b[2],
+    a[0]*b[1] - a[1]*b[0]
+  ];
+}
+
+function vector3Dot(a, b) {
+  return a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+}
+
+// Complementary filter for sensor fusion
+function updateOrientationWithSensorFusion(accel, gyro, dt) {
+  // Convert gyro from degrees/sec to radians/sec if needed
+  const gyroRad = gyro.map(g => g * (Math.PI / 180));
+
+  // Step 1: Integrate gyroscope to get orientation change
+  const gyroMagnitude = vector3Magnitude(gyroRad);
+  if (gyroMagnitude > GYRO_NOISE_THRESHOLD && dt > 0) {
+    const axis = vector3Normalize(gyroRad);
+    const angle = gyroMagnitude * dt;
+
+    // Create rotation quaternion from axis-angle
+    const halfAngle = angle * 0.5;
+    const sinHalfAngle = Math.sin(halfAngle);
+    const deltaQ = [
+      Math.cos(halfAngle),
+      axis[0] * sinHalfAngle,
+      axis[1] * sinHalfAngle,
+      axis[2] * sinHalfAngle
+    ];
+
+    // Update quaternion with gyro integration
+    quaternion = quaternionNormalize(quaternionMultiply(quaternion, deltaQ));
+  }
+
+  // Step 2: Use accelerometer for drift correction (complementary filter)
+  const accelMagnitude = vector3Magnitude(accel);
+
+  // Only use accelerometer if it's close to 1g (not under excessive acceleration)
+  if (Math.abs(accelMagnitude - 9.81) < ACCEL_NOISE_THRESHOLD) {
+    // Normalize accelerometer reading
+    const accelNorm = vector3Normalize(accel);
+
+    // Expected gravity direction in body frame (rotate world gravity by current orientation)
+    const expectedGravity = rotateVectorByQuaternion(gravity, quaternion);
+    const expectedGravityNorm = vector3Normalize(expectedGravity);
+
+    // Calculate error between measured and expected gravity
+    const error = vector3Cross(accelNorm, expectedGravityNorm);
+    const errorMagnitude = vector3Magnitude(error);
+
+    if (errorMagnitude > 0.001) { // Avoid division by zero
+      // Create correction quaternion
+      const errorAxis = vector3Normalize(error);
+      const correctionAngle = errorMagnitude * (1 - ALPHA) * dt; // Scale by complementary filter constant
+      const halfCorrectionAngle = correctionAngle * 0.5;
+      const sinHalfCorrection = Math.sin(halfCorrectionAngle);
+
+      const correctionQ = [
+        Math.cos(halfCorrectionAngle),
+        errorAxis[0] * sinHalfCorrection,
+        errorAxis[1] * sinHalfCorrection,
+        errorAxis[2] * sinHalfCorrection
+      ];
+
+      // Apply correction to quaternion
+      quaternion = quaternionNormalize(quaternionMultiply(correctionQ, quaternion));
+    }
+  }
+
+  return quaternion;
+}
+
+function removeGravityFromAcceleration(rawAccel) {
+  // Get current gravity vector in body frame using quaternion
+  const gravityInBodyFrame = rotateVectorByQuaternion(gravity, quaternionConjugate(quaternion));
+
+  // Subtract gravity to get linear acceleration
+  return [
+    rawAccel[0] - gravityInBodyFrame[0],
+    rawAccel[1] - gravityInBodyFrame[1],
+    rawAccel[2] - gravityInBodyFrame[2]
+  ];
+}
+
+// Helper: integrate for velocity and position via trapezoidal rule
+function trapezoidalIntegrate(prevVal, prevAccel, currAccel, dt) {
+  // Simple trapezoidal integral: previous value + average acceleration * dt
+  return prevVal + ((prevAccel + currAccel) / 2) * dt;
+}
+
+const socket = io();
+
+socket.on('accel-data', data => {
+  // Calculate dt
+  let axis = ['x','y','z'];
+  const rawAccel = [data.x, data.y, data.z];
+
+  axis.forEach(ax => {
+    let arr = dataArrays[ax];
+    const lastIdx = arr.timestamp.length - 1;
+    let dt = lastIdx >= 0 ? (data.timestamp - arr.timestamp[lastIdx]) / 1000.0 : 0; // Convert to seconds
+
+    arr.timestamp.push(data.timestamp);
+    arr.accel.push(data[ax]); // Store raw acceleration
+  });
+
+  // Update arrays for plotting (we need dt for sensor fusion)
+  const lastIdx = dataArrays.x.timestamp.length - 1;
+  const dt = lastIdx > 0 ? (dataArrays.x.timestamp[lastIdx] - dataArrays.x.timestamp[lastIdx-1]) / 1000.0 : 0;
+
+  // Store fused acceleration values for integration
+  const fusedAccel = removeGravityFromAcceleration(rawAccel);
+  dataArrays.x.fusedAccel.push(fusedAccel[0]);
+  dataArrays.y.fusedAccel.push(fusedAccel[1]);
+  dataArrays.z.fusedAccel.push(fusedAccel[2]);
+
+  // Calculate velocity and position from FUSED acceleration
+  axis.forEach((ax, axisIndex) => {
+    let arr = dataArrays[ax];
+    if (lastIdx < 1) {
+      arr.velocity.push(0); // Initial velocity
+      arr.position.push(0); // Initial position
+    } else {
+      let v = trapezoidalIntegrate(arr.velocity[lastIdx-1], arr.fusedAccel[lastIdx-1], arr.fusedAccel[lastIdx], dt);
+      arr.velocity.push(v);
+      let p = trapezoidalIntegrate(arr.position[lastIdx-1], arr.velocity[lastIdx-1], v, dt);
+      arr.position.push(p);
+    }
+  });
+
+  // Each axis: push new data to corresponding Plotly trace
+  Plotly.extendTraces(
+    chartDiv,
+    {
+      x: [
+        [data.timestamp], // raw x accel
+        [data.timestamp], // raw y accel
+        [data.timestamp], // raw z accel
+        [data.timestamp], // fused x accel
+        [data.timestamp], // fused y accel
+        [data.timestamp], // fused z accel
+        [data.timestamp], // x velocity
+        [data.timestamp], // y velocity
+        [data.timestamp], // z velocity
+        [data.timestamp], // x position
+        [data.timestamp], // y position
+        [data.timestamp]  // z position
+      ],
+      y: [
+        [data.x], // raw x accel
+        [data.y], // raw y accel
+        [data.z], // raw z accel
+        [dataArrays.x.fusedAccel[dataArrays.x.fusedAccel.length-1]], // fused x accel
+        [dataArrays.y.fusedAccel[dataArrays.y.fusedAccel.length-1]], // fused y accel
+        [dataArrays.z.fusedAccel[dataArrays.z.fusedAccel.length-1]], // fused z accel
+        [dataArrays.x.velocity[dataArrays.x.velocity.length-1]], // x vel
+        [dataArrays.y.velocity[dataArrays.y.velocity.length-1]], // y vel
+        [dataArrays.z.velocity[dataArrays.z.velocity.length-1]], // z vel
+        [dataArrays.x.position[dataArrays.x.position.length-1]], // x pos
+        [dataArrays.y.position[dataArrays.y.position.length-1]], // y pos
+        [dataArrays.z.position[dataArrays.z.position.length-1]]  // z pos
+      ]
+    },
+    [0,1,2,3,4,5,6,7,8,9,10,11], 200 // Last 200 points
+  );
+});
+
+socket.on('gyro-data', data => {
+  // Use gyroscope data for sensor fusion orientation estimation
+  // The gyro data should be in degrees/second format: {x: pitch_rate, y: roll_rate, z: yaw_rate}
+  const gyro = [data.x, data.y, data.z]; // [pitch_rate, roll_rate, yaw_rate] in deg/s
+
+  // Get the most recent accelerometer data for sensor fusion
+  if (dataArrays.x.accel.length > 0) {
+    const latestAccel = [
+      dataArrays.x.accel[dataArrays.x.accel.length-1],
+      dataArrays.y.accel[dataArrays.y.accel.length-1],
+      dataArrays.z.accel[dataArrays.z.accel.length-1]
+    ];
+
+    // Calculate dt from gyro timestamps if available, otherwise use fixed rate
+    const dt = data.timestamp ? 0.01 : 0.01; // Assume 100Hz if timestamp not available
+
+    // Update orientation using sensor fusion
+    updateOrientationWithSensorFusion(latestAccel, gyro, dt);
+  }
+});
+</script>
