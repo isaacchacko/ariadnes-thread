@@ -21,6 +21,11 @@ app.post('/gyro', (req, res) => {
   res.sendStatus(200);
 });
 
+app.post('/magnetometer', (req, res) => {
+  io.emit('magnetometer-data', req.body); // push to browser clients
+  res.sendStatus(200);
+});
+
 app.get('/', (req, res) => {
   res.json("good");
   console.log('good ping');
